@@ -1,0 +1,344 @@
+//@version=6
+indicator("ChanLun Core (Fenxing/Bi/Zhongshu)", shorttitle = "ChanLun Core", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 200)
+
+// This script implements a deterministic TradingView-friendly subset of ChanLun:
+// inclusion-adjusted K-lines, confirmed fractals, confirmed strokes, stroke centers,
+// and confirmed 1/2/3 buy-sell labels. It intentionally does not attempt full
+// multi-level recursive segment decomposition.
+
+showStrokes = input.bool(true, "Show strokes", group = "Display")
+showCenters = input.bool(true, "Show stroke centers", group = "Display")
+showSignals = input.bool(true, "Show buy/sell labels", group = "Display")
+
+maxStrokeDrawings = input.int(120, "Max stroke lines", minval = 10, maxval = 450, group = "Limits")
+maxCenterDrawings = input.int(40, "Max center boxes", minval = 5, maxval = 150, group = "Limits")
+maxLabelDrawings = input.int(160, "Max labels", minval = 10, maxval = 450, group = "Limits")
+maxDataHistory = input.int(500, "Max data history", minval = 100, maxval = 5000, group = "Limits")
+
+minStrokeBars = input.int(4, "Minimum raw bars per stroke", minval = 1, maxval = 50, group = "Sensitivity")
+strictFractal = input.bool(true, "Strict fractals", group = "Sensitivity")
+useMacdDivergence = input.bool(true, "Require MACD divergence for first buy/sell", group = "Sensitivity")
+labelOffsetAtr = input.float(0.15, "Signal label ATR offset", minval = 0.0, maxval = 2.0, step = 0.05, group = "Sensitivity")
+
+strokeUpColor = input.color(color.rgb(40, 120, 255), "Up stroke", group = "Colors")
+strokeDownColor = input.color(color.rgb(240, 90, 70), "Down stroke", group = "Colors")
+centerColor = input.color(color.rgb(255, 184, 77), "Center", group = "Colors")
+
+[macdLine, macdSignal, macdHist] = ta.macd(close, 12, 26, 9)
+float labelOffset = math.max(nz(ta.atr(14) * labelOffsetAtr, (high - low) * 0.3), syminfo.mintick * 5)
+
+var array<float> normHighs = array.new<float>()
+var array<float> normLows = array.new<float>()
+var array<int> normIndexes = array.new<int>()
+var int mergeDir = 1
+
+var array<int> pivotTypes = array.new<int>()      // 1 = top, -1 = bottom
+var array<float> pivotPrices = array.new<float>()
+var array<int> pivotIndexes = array.new<int>()
+
+var array<float> strokeHighs = array.new<float>()
+var array<float> strokeLows = array.new<float>()
+var array<int> strokeStarts = array.new<int>()
+var array<int> strokeEnds = array.new<int>()
+var array<int> strokeDirs = array.new<int>()      // 1 = up, -1 = down
+
+var array<line> strokeLines = array.new<line>()
+var array<box> centerBoxes = array.new<box>()
+var array<label> allLabels = array.new<label>()
+
+var bool activeCenter = false
+var float activeZD = na
+var float activeZG = na
+var int activeLeft = na
+var box activeBox = na
+
+var float lastCenterZD = na
+var float lastCenterZG = na
+var int centerBreakDir = 0
+
+var float centerOutsideLowPrice = na
+var float centerOutsideLowMacd = na
+var float centerOutsideHighPrice = na
+var float centerOutsideHighMacd = na
+
+var bool waitSecondBuy = false
+var float firstBuyPrice = na
+var bool waitSecondSell = false
+var float firstSellPrice = na
+
+bool buy1Signal = false
+bool buy2Signal = false
+bool buy3Signal = false
+bool sell1Signal = false
+bool sell2Signal = false
+bool sell3Signal = false
+
+trimLines(array<line> ids, int maxCount) =>
+    while array.size(ids) > maxCount
+        line.delete(array.shift(ids))
+
+trimBoxes(array<box> ids, int maxCount) =>
+    while array.size(ids) > maxCount
+        box.delete(array.shift(ids))
+
+trimLabels(array<label> ids, int maxCount) =>
+    while array.size(ids) > maxCount
+        label.delete(array.shift(ids))
+
+trimNormData() =>
+    while array.size(normHighs) > maxDataHistory
+        array.shift(normHighs)
+        array.shift(normLows)
+        array.shift(normIndexes)
+
+trimPivotData() =>
+    while array.size(pivotTypes) > maxDataHistory
+        array.shift(pivotTypes)
+        array.shift(pivotPrices)
+        array.shift(pivotIndexes)
+
+trimStrokeData() =>
+    while array.size(strokeHighs) > maxDataHistory
+        array.shift(strokeHighs)
+        array.shift(strokeLows)
+        array.shift(strokeStarts)
+        array.shift(strokeEnds)
+        array.shift(strokeDirs)
+
+isTopFractal(float h1, float l1, float h2, float l2, float h3, float l3, bool strictMode) =>
+    strictMode ? (h2 > h1 and h2 > h3 and l2 > l1 and l2 > l3) : (h2 >= h1 and h2 >= h3 and l2 >= l1 and l2 >= l3 and (h2 > h1 or h2 > h3))
+
+isBottomFractal(float h1, float l1, float h2, float l2, float h3, float l3, bool strictMode) =>
+    strictMode ? (l2 < l1 and l2 < l3 and h2 < h1 and h2 < h3) : (l2 <= l1 and l2 <= l3 and h2 <= h1 and h2 <= h3 and (l2 < l1 or l2 < l3))
+
+addLabel(int x, float y, string txt, color bg, color fg, string style) =>
+    label lb = label.new(x, y, txt, xloc = xloc.bar_index, yloc = yloc.price, style = style, color = bg, textcolor = fg, size = size.tiny, force_overlay = true)
+    array.push(allLabels, lb)
+    trimLabels(allLabels, maxLabelDrawings)
+
+tryBuildCenter() =>
+    bool started = false
+    float zdOut = na
+    float zgOut = na
+    int leftOut = na
+    box boxOut = na
+    int n = array.size(strokeHighs)
+    if n >= 3
+        float h1 = array.get(strokeHighs, n - 3)
+        float h2 = array.get(strokeHighs, n - 2)
+        float h3 = array.get(strokeHighs, n - 1)
+        float l1 = array.get(strokeLows, n - 3)
+        float l2 = array.get(strokeLows, n - 2)
+        float l3 = array.get(strokeLows, n - 1)
+        float zd = math.max(math.max(l1, l2), l3)
+        float zg = math.min(math.min(h1, h2), h3)
+        if zd <= zg
+            zdOut := zd
+            zgOut := zg
+            leftOut := array.get(strokeStarts, n - 3)
+            if showCenters
+                boxOut := box.new(leftOut, zgOut, array.get(strokeEnds, n - 1), zdOut, xloc = xloc.bar_index, border_color = color.new(centerColor, 0), bgcolor = color.new(centerColor, 86), force_overlay = true)
+                array.push(centerBoxes, boxOut)
+                trimBoxes(centerBoxes, maxCenterDrawings)
+            started := true
+    [started, zdOut, zgOut, leftOut, boxOut]
+
+if barstate.isconfirmed
+    buy1Signal := false
+    buy2Signal := false
+    buy3Signal := false
+    sell1Signal := false
+    sell2Signal := false
+    sell3Signal := false
+
+    bool pushedNorm = false
+    int normCount = array.size(normHighs)
+    if normCount == 0
+        array.push(normHighs, high)
+        array.push(normLows, low)
+        array.push(normIndexes, bar_index)
+        trimNormData()
+        pushedNorm := true
+    else
+        float lastH = array.get(normHighs, normCount - 1)
+        float lastL = array.get(normLows, normCount - 1)
+        bool hasContainment = (high <= lastH and low >= lastL) or (high >= lastH and low <= lastL)
+        if hasContainment
+            if normCount >= 2
+                float prevH = array.get(normHighs, normCount - 2)
+                float prevL = array.get(normLows, normCount - 2)
+                mergeDir := lastH >= prevH ? 1 : lastL <= prevL ? -1 : mergeDir
+            else
+                mergeDir := high >= lastH ? 1 : -1
+
+            float mergedH = mergeDir == 1 ? math.max(lastH, high) : math.min(lastH, high)
+            float mergedL = mergeDir == 1 ? math.max(lastL, low) : math.min(lastL, low)
+            array.set(normHighs, normCount - 1, mergedH)
+            array.set(normLows, normCount - 1, mergedL)
+            array.set(normIndexes, normCount - 1, bar_index)
+        else
+            mergeDir := high > lastH or low > lastL ? 1 : high < lastH or low < lastL ? -1 : mergeDir
+            array.push(normHighs, high)
+            array.push(normLows, low)
+            array.push(normIndexes, bar_index)
+            trimNormData()
+            pushedNorm := true
+
+    if pushedNorm and array.size(normHighs) >= 3
+        int n = array.size(normHighs)
+        float h1 = array.get(normHighs, n - 3)
+        float l1 = array.get(normLows, n - 3)
+        float h2 = array.get(normHighs, n - 2)
+        float l2 = array.get(normLows, n - 2)
+        float h3 = array.get(normHighs, n - 1)
+        float l3 = array.get(normLows, n - 1)
+        int pivotIdx = array.get(normIndexes, n - 2)
+
+        bool topFx = isTopFractal(h1, l1, h2, l2, h3, l3, strictFractal)
+        bool botFx = isBottomFractal(h1, l1, h2, l2, h3, l3, strictFractal)
+        int fxType = topFx ? 1 : botFx ? -1 : 0
+        float fxPrice = topFx ? h2 : botFx ? l2 : na
+
+        if fxType != 0
+            int pCount = array.size(pivotTypes)
+            if pCount == 0
+                array.push(pivotTypes, fxType)
+                array.push(pivotPrices, fxPrice)
+                array.push(pivotIndexes, pivotIdx)
+                trimPivotData()
+            else
+                int lastType = array.get(pivotTypes, pCount - 1)
+                float lastPrice = array.get(pivotPrices, pCount - 1)
+                int lastIdx = array.get(pivotIndexes, pCount - 1)
+                bool replaceSame = fxType == lastType and ((fxType == 1 and fxPrice > lastPrice) or (fxType == -1 and fxPrice < lastPrice))
+
+                if replaceSame
+                    array.set(pivotPrices, pCount - 1, fxPrice)
+                    array.set(pivotIndexes, pCount - 1, pivotIdx)
+                    int sCount = array.size(strokeHighs)
+                    if sCount > 0 and pCount >= 2
+                        float prevPivotPrice = array.get(pivotPrices, pCount - 2)
+                        int prevPivotIdx = array.get(pivotIndexes, pCount - 2)
+                        array.set(strokeHighs, sCount - 1, math.max(prevPivotPrice, fxPrice))
+                        array.set(strokeLows, sCount - 1, math.min(prevPivotPrice, fxPrice))
+                        array.set(strokeEnds, sCount - 1, pivotIdx)
+                        if array.size(strokeLines) > 0
+                            line.set_xy2(array.get(strokeLines, array.size(strokeLines) - 1), pivotIdx, fxPrice)
+                else if fxType != lastType and pivotIdx - lastIdx >= minStrokeBars
+                    array.push(pivotTypes, fxType)
+                    array.push(pivotPrices, fxPrice)
+                    array.push(pivotIndexes, pivotIdx)
+                    trimPivotData()
+
+                    int strokeDir = lastType == -1 and fxType == 1 ? 1 : -1
+                    float strokeH = math.max(lastPrice, fxPrice)
+                    float strokeL = math.min(lastPrice, fxPrice)
+                    array.push(strokeHighs, strokeH)
+                    array.push(strokeLows, strokeL)
+                    array.push(strokeStarts, lastIdx)
+                    array.push(strokeEnds, pivotIdx)
+                    array.push(strokeDirs, strokeDir)
+                    trimStrokeData()
+
+                    if showStrokes
+                        line ln = line.new(lastIdx, lastPrice, pivotIdx, fxPrice, xloc = xloc.bar_index, extend = extend.none, color = strokeDir == 1 ? strokeUpColor : strokeDownColor, width = 2, force_overlay = true)
+                        array.push(strokeLines, ln)
+                        trimLines(strokeLines, maxStrokeDrawings)
+
+                    float refZD = activeCenter ? activeZD : lastCenterZD
+                    float refZG = activeCenter ? activeZG : lastCenterZG
+                    bool hasRefCenter = not na(refZD) and not na(refZG)
+
+                    if hasRefCenter
+                        bool overlapsRef = strokeH >= refZD and strokeL <= refZG
+                        if overlapsRef
+                            centerBreakDir := 0
+                        else if centerBreakDir == 0
+                            centerBreakDir := strokeL > refZG ? 1 : strokeH < refZD ? -1 : 0
+                        else if centerBreakDir == 1 and strokeDir == -1 and fxType == -1
+                            buy3Signal := fxPrice > refZG
+                            centerBreakDir := buy3Signal ? 0 : centerBreakDir
+                        else if centerBreakDir == -1 and strokeDir == 1 and fxType == 1
+                            sell3Signal := fxPrice < refZD
+                            centerBreakDir := sell3Signal ? 0 : centerBreakDir
+
+                    if fxType == -1
+                        bool isCenterOutsideLow = hasRefCenter and fxPrice < refZD
+                        bool buyMacdOk = not useMacdDivergence or (isCenterOutsideLow and not na(centerOutsideLowPrice) and fxPrice < centerOutsideLowPrice and macdHist > centerOutsideLowMacd)
+                        buy1Signal := hasRefCenter and fxPrice < refZD and strokeDir == -1 and buyMacdOk
+                        buy2Signal := waitSecondBuy and not buy1Signal and hasRefCenter and fxPrice > firstBuyPrice and fxPrice >= refZD
+                        if buy1Signal
+                            waitSecondBuy := true
+                            firstBuyPrice := fxPrice
+                        if buy2Signal
+                            waitSecondBuy := false
+                        if isCenterOutsideLow
+                            centerOutsideLowPrice := fxPrice
+                            centerOutsideLowMacd := macdHist
+
+                    if fxType == 1
+                        bool isCenterOutsideHigh = hasRefCenter and fxPrice > refZG
+                        bool sellMacdOk = not useMacdDivergence or (isCenterOutsideHigh and not na(centerOutsideHighPrice) and fxPrice > centerOutsideHighPrice and macdHist < centerOutsideHighMacd)
+                        sell1Signal := hasRefCenter and fxPrice > refZG and strokeDir == 1 and sellMacdOk
+                        sell2Signal := waitSecondSell and not sell1Signal and hasRefCenter and fxPrice < firstSellPrice and fxPrice <= refZG
+                        if sell1Signal
+                            waitSecondSell := true
+                            firstSellPrice := fxPrice
+                        if sell2Signal
+                            waitSecondSell := false
+                        if isCenterOutsideHigh
+                            centerOutsideHighPrice := fxPrice
+                            centerOutsideHighMacd := macdHist
+
+                    if showSignals
+                        if buy1Signal
+                            addLabel(pivotIdx, fxPrice - labelOffset, "一买", color.new(color.lime, 0), color.black, label.style_label_up)
+                        if buy2Signal
+                            addLabel(pivotIdx, fxPrice - labelOffset, "二买", color.new(color.green, 0), color.white, label.style_label_up)
+                        if buy3Signal
+                            addLabel(pivotIdx, fxPrice - labelOffset, "三买", color.new(color.teal, 0), color.white, label.style_label_up)
+                        if sell1Signal
+                            addLabel(pivotIdx, fxPrice + labelOffset, "一卖", color.new(color.red, 0), color.white, label.style_label_down)
+                        if sell2Signal
+                            addLabel(pivotIdx, fxPrice + labelOffset, "二卖", color.new(color.maroon, 0), color.white, label.style_label_down)
+                        if sell3Signal
+                            addLabel(pivotIdx, fxPrice + labelOffset, "三卖", color.new(color.orange, 0), color.black, label.style_label_down)
+
+                    bool needNewCenter = false
+                    if activeCenter
+                        bool overlapsActive = strokeH >= activeZD and strokeL <= activeZG
+                        if overlapsActive
+                            activeZD := math.max(activeZD, strokeL)
+                            activeZG := math.min(activeZG, strokeH)
+                            lastCenterZD := activeZD
+                            lastCenterZG := activeZG
+                            centerBreakDir := 0
+                            if showCenters and not na(activeBox)
+                                box.set_right(activeBox, pivotIdx)
+                                box.set_top(activeBox, activeZG)
+                                box.set_bottom(activeBox, activeZD)
+                        else
+                            activeCenter := false
+                            activeBox := na
+                            needNewCenter := true
+                    else
+                        needNewCenter := true
+
+                    if needNewCenter
+                        [centerStarted, centerZD, centerZG, centerLeft, centerBox] = tryBuildCenter()
+                        if centerStarted
+                            activeCenter := true
+                            activeZD := centerZD
+                            activeZG := centerZG
+                            activeLeft := centerLeft
+                            activeBox := centerBox
+                            lastCenterZD := centerZD
+                            lastCenterZG := centerZG
+                            centerBreakDir := 0
+
+alertcondition(buy1Signal, "缠论确认一买", "缠论确认一买")
+alertcondition(buy2Signal, "缠论确认二买", "缠论确认二买")
+alertcondition(buy3Signal, "缠论确认三买", "缠论确认三买")
+alertcondition(sell1Signal, "缠论确认一卖", "缠论确认一卖")
+alertcondition(sell2Signal, "缠论确认二卖", "缠论确认二卖")
+alertcondition(sell3Signal, "缠论确认三卖", "缠论确认三卖")
